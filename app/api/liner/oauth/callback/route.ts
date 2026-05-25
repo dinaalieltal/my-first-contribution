@@ -1,85 +1,87 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
+import { createServiceClient } from '@/lib/supabase/service';
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const code = searchParams.get('code');
+  const state = searchParams.get('state');
+  const error = searchParams.get('error');
 
-export async function GET(req: NextRequest) {
-  const code = req.nextUrl.searchParams.get('code');
-  const userId = req.nextUrl.searchParams.get('state');
   const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
 
-  if (!code || !userId) {
-    return NextResponse.redirect(`${appUrl}/settings?liner_error=missing_params`);
+  if (error) {
+    return NextResponse.redirect(`${appUrl}/settings?error=liner_denied`);
   }
 
-  const clientId = process.env.LINER_CLIENT_ID!;
-  const clientSecret = process.env.LINER_CLIENT_SECRET!;
-  const redirectUri = `${appUrl}/api/liner/oauth/callback`;
+  // Validate state (CSRF)
+  const storedState = request.cookies.get('liner_oauth_state')?.value;
+  if (!state || state !== storedState) {
+    return NextResponse.redirect(`${appUrl}/settings?error=invalid_state`);
+  }
+
+  if (!code) {
+    return NextResponse.redirect(`${appUrl}/settings?error=no_code`);
+  }
 
   try {
+    const redirectUri = process.env.LINER_REDIRECT_URI ||
+      `${appUrl}/api/liner/oauth/callback`;
+
     // Exchange code for tokens
-    const tokenRes = await fetch('https://getliner.com/oauth/token', {
+    const tokenRes = await fetch('https://api.getliner.com/oauth/token', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: process.env.LINER_CLIENT_ID,
+        client_secret: process.env.LINER_CLIENT_SECRET,
         code,
         redirect_uri: redirectUri,
-        client_id: clientId,
-        client_secret: clientSecret,
+        grant_type: 'authorization_code',
       }),
     });
 
     if (!tokenRes.ok) {
-      const err = await tokenRes.text();
-      console.error('Liner token exchange failed:', err);
-      return NextResponse.redirect(`${appUrl}/settings?liner_error=token_exchange`);
+      throw new Error(`Token exchange failed: ${tokenRes.status}`);
     }
 
-    const tokenData = await tokenRes.json();
-    const { access_token, refresh_token, expires_in } = tokenData;
+    const tokens = await tokenRes.json();
 
     // Fetch Liner user profile
     let linerUser: { id?: string; email?: string; name?: string } = {};
     try {
-      const profileRes = await fetch('https://getliner.com/api/v1/me', {
-        headers: { Authorization: `Bearer ${access_token}` },
+      const profileRes = await fetch('https://api.getliner.com/v1/me', {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
       });
-      if (profileRes.ok) {
-        linerUser = await profileRes.json();
-      }
-    } catch {
-      // Non-fatal — proceed without profile info
-    }
+      if (profileRes.ok) linerUser = await profileRes.json();
+    } catch { /* profile fetch is non-fatal */ }
 
-    const tokenExpiresAt = expires_in
-      ? new Date(Date.now() + expires_in * 1000).toISOString()
+    // Get Orchpad user from session cookie (use service client for server-side upsert)
+    const supabase = createServiceClient();
+
+    // We'll use a demo user ID derived from the Liner user for now
+    // In a real Orchpad integration, pull from the session
+    const userId = linerUser.id ? `liner_${linerUser.id}` : `anon_${crypto.randomUUID()}`;
+
+    const expiresAt = tokens.expires_in
+      ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
       : null;
 
-    // Upsert connection in Supabase
-    const { error } = await supabase.from('liner_connections').upsert({
+    await supabase.from('liner_connections').upsert({
       user_id: userId,
-      liner_user_id: linerUser.id || null,
-      liner_email: linerUser.email || null,
-      liner_name: linerUser.name || null,
-      access_token,
-      refresh_token: refresh_token || null,
-      token_expires_at: tokenExpiresAt,
-      connected_at: new Date().toISOString(),
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token ?? null,
+      token_expires_at: expiresAt,
+      liner_user_id: linerUser.id ?? null,
+      liner_user_email: linerUser.email ?? null,
+      liner_user_name: linerUser.name ?? null,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'user_id' });
 
-    if (error) {
-      console.error('Supabase upsert error:', error);
-      return NextResponse.redirect(`${appUrl}/settings?liner_error=db_error`);
-    }
-
-    return NextResponse.redirect(`${appUrl}/settings?liner_connected=1`);
+    const response = NextResponse.redirect(`${appUrl}/settings?connected=true`);
+    response.cookies.delete('liner_oauth_state');
+    return response;
   } catch (err) {
-    console.error('OAuth callback error:', err);
-    return NextResponse.redirect(`${appUrl}/settings?liner_error=unexpected`);
+    console.error('Liner OAuth callback error:', err);
+    return NextResponse.redirect(`${appUrl}/settings?error=oauth_failed`);
   }
 }
